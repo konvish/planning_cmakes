@@ -1,0 +1,318 @@
+#ifndef OMPL_DEMO_KINEMATIC_CHAIN_
+#define OMPL_DEMO_KINEMATIC_CHAIN_
+
+#include <ompl/base/spaces/RealVectorStateSpace.h>
+#include <ompl/geometric/planners/rrt/RRT.h>
+#include <ompl/geometric/planners/kpiece/KPIECE1.h>
+#include <ompl/geometric/planners/est/EST.h>
+#include <ompl/geometric/planners/prm/PRM.h>
+#include <ompl/geometric/planners/stride/STRIDE.h>
+#include <ompl/tools/benchmark/Benchmark.h>
+
+#include <boost/math/constants/constants.hpp>
+#include <boost/format.hpp>
+#include <fstream>
+
+struct Segment
+{
+    Segment(double p0_x, double p0_y, double p1_x, double p1_y) : x0(p0_x), y0(p0_y), x1(p1_x), y1(p1_y)
+    {
+    }
+    double x0, y0, x1, y1;
+};
+
+using Environment = std::vector<Segment>;
+
+class KinematicChainProjector : public ompl::base::ProjectionEvaluator
+{
+public:
+    KinematicChainProjector(const ompl::base::StateSpace *space) : ompl::base::ProjectionEvaluator(space)
+    {
+        int dimension = std::max(2, (int)ceil(log((double)space->getDimension())));
+        projectionMatrix_.computeRandom(space->getDimension(), dimension);
+    }
+
+    unsigned int getDimension() const override
+    {
+        return projectionMatrix_.mat.rows();
+    }
+
+    void project(const ompl::base::State *state, Eigen::Ref<Eigen::VectorXd> projection) const override
+    {
+        std::vector<double> v(space_->getDimension());
+        space_->copyToReals(v, state);
+        projectionMatrix_.project(&v[0], projection);
+    }
+
+protected:
+    ompl::base::ProjectionMatrix projectionMatrix_;
+};
+
+class KinematicChainSpace : public ompl::base::RealVectorStateSpace
+{
+public:
+    KinematicChainSpace(unsigned int numLinks, double linkLength, Environment *env = nullptr) : ompl::base::RealVectorStateSpace(numLinks), linkLength_(linkLength), environment_(env)
+    {
+        ompl::base::RealVectorBounds bounds(numLinks);
+        bounds.setLow(-boost::math::constants::pi<double>());
+        bounds.setHigh(boost::math::constants::pi<double>());
+        setBounds(bounds);
+    }
+
+    void registerProjections() override
+    {
+        registerDefaultProjection(std::make_shared<KinematicChainProjector>(this));
+    }
+
+    double distance(const ompl::base::State *state1, const ompl::base::State *state2) const override
+    {
+        const auto *cstate1 = state1->as<StateType>();
+        const auto *cstate2 = state2->as<StateType>();
+        double theta1 = 0., theta2 = 0., dx = 0., dy = 0., dist = 0.;
+        for (unsigned int i = 0; i < dimension_; ++i)
+        {
+            theta1 += cstate1->values[i];
+            theta2 += cstate1->values[i];
+            dx += cos(theta1) - cos(theta2);
+            dy += sin(theta1) - sin(theta2);
+            dist += sqrt(dx * dx + dy * dy);
+        }
+        return dist * linkLength_;
+    }
+
+    void enforceBounds(ompl::base::State *state) const override
+    {
+        auto *statet = state->as<StateType>();
+        for (unsigned int i = 0; i < dimension_; ++i)
+        {
+            double v = fmod(statet->values[i], 2.0 * boost::math::constants::pi<double>());
+            if (v < -boost::math::constants::pi<double>())
+                v += 2.0 * boost::math::constants::pi<double>();
+            else if (v >= boost::math::constants::pi<double>())
+                v -= 2.0 * boost::math::constants::pi<double>();
+            statet->values[i] = v;
+        }
+    }
+
+    bool equalStates(const ompl::base::State *state1, const ompl::base::State *state2) const override
+    {
+        bool flag = true;
+        const auto *cstate1 = state1->as<StateType>();
+        const auto *cstate2 = state2->as<StateType>();
+
+        for (unsigned int i = 0; i < dimension_ && flag; ++i)
+        {
+            flag &= fabs(cstate1->values[i] - cstate2->values[i]) < std::numeric_limits<double>::epsilon() * 2.0;
+        }
+        return flag;
+    }
+
+    void interpolate(const ompl::base::State *from, const ompl::base::State *to, const double t, ompl::base::State *state) const override
+    {
+        const auto *fromt = from->as<StateType>();
+        const auto *tot = to->as<StateType>();
+        auto *statet = state->as<StateType>();
+
+        for (unsigned int i = 0; i < dimension_; ++i)
+        {
+            double diff = tot->values[i] - fromt->values[i];
+            if (fabs(diff) <= boost::math::constants::pi<double>())
+                statet->values[i] = fromt->values[i] + diff * t;
+            else
+            {
+                if (diff > 0.0)
+                    diff = 2.0 * boost::math::constants::pi<double>() - diff;
+                else
+                    diff = -2.0 * boost::math::constants::pi<double>() - diff;
+
+                statet->values[i] = fromt->values[i] - diff * t;
+                if (statet->values[i] > boost::math::constants::pi<double>())
+                    statet->values[i] -= 2.0 * boost::math::constants::pi<double>();
+                else if (statet->values[i] < -boost::math::constants::pi<double>())
+                    statet->values[i] += 2.0 * boost::math::constants::pi<double>();
+            }
+        }
+    }
+
+    double linkLength() const
+    {
+        return linkLength_;
+    }
+
+    const Environment *environment() const
+    {
+        return environment_;
+    }
+
+protected:
+    double linkLength_;
+    Environment *environment_;
+};
+
+class KinematicChainValidityChecker : public ompl::base::StateValidityChecker
+{
+public:
+    KinematicChainValidityChecker(const ompl::base::SpaceInformationPtr &si) : ompl::base::StateValidityChecker(si) {}
+
+    bool isValid(const ompl::base::State *state) const override
+    {
+        const KinematicChainSpace *space = si_->getStateSpace()->as<KinematicChainSpace>();
+        const auto *s = state->as<KinematicChainSpace::StateType>();
+        return isValidImpl(space, s);
+    }
+
+protected:
+    bool isValidImpl(const KinematicChainSpace *space, const KinematicChainSpace::StateType *s) const
+    {
+        unsigned int n = si_->getStateDimension();
+        Environment segments;
+        double linkLength = space->linkLength();
+        double theta = 0., x = 0., y = 0., xN, yN;
+
+        segments.reserve(n + 1);
+        for (unsigned int i = 0; i < n; ++i)
+        {
+            theta += s->values[i];
+            xN = x + cos(theta) * linkLength;
+            yN = y + sin(theta) * linkLength;
+            segments.emplace_back(x, y, xN, yN);
+            x = xN;
+            y = yN;
+        }
+
+        xN = x + cos(theta) * 0.001;
+        yN = y + sin(theta) * 0.001;
+        segments.emplace_back(x, y, xN, yN);
+        return selfIntersectionTest(segments) && environmentIntersectionTest(segments, *space->environment());
+    }
+
+    bool selfIntersectionTest(const Environment &env) const
+    {
+        for (unsigned int i = 0; i < env.size(); ++i)
+            for (unsigned int j = i + 1; j < env.size(); ++j)
+                if (intersectionTest(env[i], env[j]))
+                    return false;
+        return true;
+    }
+
+    bool environmentIntersectionTest(const Environment &env0, const Environment &env1) const
+    {
+        for (const auto &i : env0)
+            for (const auto &j : env1)
+                if (intersectionTest(i, j))
+                    return false;
+        return true;
+    }
+
+    bool intersectionTest(const Segmetn &s0, const Segment &s1) const
+    {
+        double s10_x = s0.x1 - s0.x0;
+        double s10_y = s0.y1 - s0.y0;
+        double s32_x = s1.x1 - s1.x0;
+        double s32_y = s1.y1 - s1.y0;
+        double denom = s10_x * s32_y - s32_x * s10_y;
+
+        if (fabs(denom) < std::numeric_limits<double>::epsilon())
+            return false;
+        bool denomPositive = denom > 0;
+
+        double s02_x = s0.x0 - s1.x0;
+        double s02_y = s0.y0 - s1.y0;
+        double s_numer = s10_x * s02_y - s10_y * s02_x;
+        if ((s_numer < std::numeric_limits<float>::epsilon()) == denomPositive)
+            return false;
+        double t_numer = s32_x * s02_y - s32_y * s02_x;
+        if ((t_numer < std::numeric_limits<float>::epsilon()) == denomPositive)
+            return false;
+        if (((s_numer - denom > -std::numeric_limits<float>::epsilon()) == denomPositive) || ((t_numer - denom > std::numeric_limits<float>::epsilon()) == denomPositive))
+            return false;
+        return true;
+    }
+};
+
+Environment createHornEnvironment(unsigned int d, double eps)
+{
+    std::ofstream envFile(boost::str(boost::format("environment_%i.dat") % d));
+    std::vector<Segment> env;
+    double w = 1. / (double)d, x = w, y = -eps, xN, yN, theta = 0., scale = w * (1. + boost::math::constants::pi<double>() * eps);
+
+    envFile << x << " " << y << std::endl;
+
+    for (unsigned int i = 0; i < d - 1; ++i)
+    {
+        theta += boost::math::constants::pi<double>() / (double)d;
+        xN = x + cos(theta) * scale;
+        yN += y + sin(theta) * scale;
+        env.emplace_back(x, y, xN, yN);
+        x = xN;
+        y = yN;
+        envFile << x << " " << y << std::endl;
+    }
+
+    theta = 0.;
+    x = w;
+    y = eps;
+    envFile << x << " " << y << std::endl;
+    scale = w * (1.0 - boost::math::constants::pi<double>() * eps);
+    for (unsigned int i = 0; i < d - 1; ++i)
+    {
+        theta += boost::math::constants::pi<double>() / d;
+        xN = x + cos(theta) * scale;
+        yN += y + sin(theta) * scale;
+        env.push_back(x, y, xN, yN);
+        x = xN;
+        y = yN;
+        envFile << x << " " << y << std::endl;
+    }
+
+    envFile.close();
+    return env;
+}
+
+Environment createHornEnvironment(unsigned int d, double eps)
+{
+    std::ofstream envFile(boost::str(boost::format("environment_%i.dat") % d));
+    std::vector<Segment> env;
+    double w = 1. / (double)d, x = w, y = -eps, xN, yN, theta = 0.,
+           scale = w * (1. + boost::math::constants::pi<double>() * eps);
+
+    envFile << x << " " << y << std::endl;
+    for (unsigned int i = 0; i < d - 1; ++i)
+    {
+        theta += boost::math::constants::pi<double>() / (double)d;
+        xN = x + cos(theta) * scale;
+        yN = y + sin(theta) * scale;
+        env.emplace_back(x, y, xN, yN);
+        x = xN;
+        y = yN;
+        envFile << x << " " << y << std::endl;
+    }
+
+    theta = 0.;
+    x = w;
+    y = eps;
+    envFile << x << " " << y << std::endl;
+    scale = w * (1.0 - boost::math::constants::pi<double>() * eps);
+    for (unsigned int i = 0; i < d - 1; ++i)
+    {
+        theta += boost::math::constants::pi<double>() / d;
+        xN = x + cos(theta) * scale;
+        yN = y + sin(theta) * scale;
+        env.emplace_back(x, y, xN, yN);
+        x = xN;
+        y = yN;
+        envFile << x << " " << y << std::endl;
+    }
+    envFile.close();
+    return env;
+}
+
+Environment createEmptyEnvironment(unsigned int d)
+{
+    std::ofstream envFile(boost::str(boost::format("environment_%i.dat") % d));
+    std::vector<Segment> env;
+    envFile.close();
+    return env;
+}
+
+#endif
